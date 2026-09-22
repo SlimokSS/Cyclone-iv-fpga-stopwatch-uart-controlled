@@ -32,6 +32,12 @@ TIME
 HH:MM:SS.CC
 ```
 
+Фактически передаваемая строка завершается `CRLF`:
+
+```text
+HH:MM:SS.CC\r\n
+```
+
 где:
 
 - `HH` — часы;
@@ -57,6 +63,7 @@ TIME
 |---|---:|
 | FPGA | Cyclone IV E EP4CE6F17C8N |
 | Тактовая частота | 50 MHz |
+| Период системного clock | 20 ns |
 | UART baud rate | 115200 baud |
 | UART format | 8N1 |
 | Разрешение секундомера | 10 ms |
@@ -85,7 +92,7 @@ uart_command_top
                     │ uart_rx │
                     └────┬────┘
                          │
-                    rx_data/rx_valid
+                  rx_data/rx_valid
                          │
                          ▼
               ┌────────────────────┐
@@ -144,14 +151,16 @@ UART-приёмник.
 
 Принимает последовательный поток от компьютера и преобразует его в 8-битные байты.
 
-Выходной интерфейс:
+Основные выходные сигналы:
 
 ```text
-data
-data_valid
+rx_data
+rx_valid
 ```
 
-Асинхронный вход UART предварительно проходит через двухрегистровый синхронизатор.
+Асинхронный UART RX input предварительно проходит через двухрегистровый синхронизатор.
+
+2-FF synchronizer не устраняет metastability физически, а даёт первому flip-flop дополнительное время на разрешение метастабильного состояния перед использованием сигнала остальной логикой.
 
 ---
 
@@ -192,7 +201,7 @@ cmd_time
 ```text
 START → running = 1
 STOP  → running = 0
-CLEAR → clear_pulse = 1 на один такт
+CLEAR → clear_pulse = 1 на один clock
 ```
 
 `running` является состоянием, а `clear_pulse` — одноклоковым событием.
@@ -222,7 +231,11 @@ centis
 23:59:59.99
 ```
 
-После `23:59:59.99` счётчик возвращается к `00:00:00.00`.
+После `23:59:59.99` счётчик возвращается к:
+
+```text
+00:00:00.00
+```
 
 ---
 
@@ -230,7 +243,7 @@ centis
 
 Формирует временную базу для секундомера.
 
-При частоте системного тактового сигнала:
+При системной частоте:
 
 ```text
 50 MHz
@@ -248,42 +261,162 @@ centis
 10 ms
 ```
 
+Генератор работает при `running = 1`.
+
 ---
 
-### `time_response_gen`
+## `time_response_gen`
 
 Формирует UART-ответ на команду `TIME`.
 
-При поступлении `cmd_time` модуль сохраняет snapshot текущего времени, чтобы значение не изменялось во время передачи UART.
+При поступлении `cmd_time` модуль сохраняет snapshot текущего времени:
 
-После этого формируется строка:
+```text
+hours
+minutes
+seconds
+centis
+```
+
+После snapshot изменение самого секундомера больше не влияет на формируемый ответ.
+
+Строка ответа:
 
 ```text
 HH:MM:SS.CC\r\n
 ```
 
-Передача реализована через интерфейс `ready/valid`.
+Всего передаётся 13 байт:
 
-Индекс следующего символа изменяется только при:
-
-```systemverilog
-m_valid && m_ready
+```text
+0   H tens
+1   H ones
+2   :
+3   M tens
+4   M ones
+5   :
+6   S tens
+7   S ones
+8   .
+9   C tens
+10  C ones
+11  CR
+12  LF
 ```
 
-Поэтому при backpressure данные остаются стабильными.
+### Control path
 
-В текущей версии преобразование binary-to-decimal реализовано через:
+Текущая версия использует FSM:
+
+```text
+IDLE
+  │
+  │ cmd_time
+  ▼
+CONVERT
+  │
+  │ conversion_done
+  ▼
+SEND
+  │
+  │ last byte && ready/valid handshake
+  ▼
+IDLE
+```
+
+В `IDLE` выполняется snapshot времени и подготовка datapath.
+
+В `CONVERT` binary-to-decimal преобразование выполняется последовательно по clock cycles.
+
+В `SEND` готовая ASCII-строка передаётся в `uart_tx`.
+
+Команда `TIME`, пришедшая во время `CONVERT` или `SEND`, в текущей архитектуре не ставится в очередь.
+
+### Binary-to-decimal conversion
+
+Первая версия formatter использовала:
 
 ```systemverilog
 value / 10
 value % 10
 ```
 
-с последующим преобразованием цифр в ASCII:
+После synthesis Quartus реализовал эти операции как достаточно дорогую комбинационную арифметику.
+
+В текущей версии используется последовательное вычитание:
+
+```text
+temp = value
+tens = 0
+
+while temp >= 10:
+    temp -= 10
+    tens++
+
+ones = temp
+```
+
+Важно: это не synthesizable software-style `while`, разворачиваемый в большую комбинационную схему.
+
+В RTL выполняется только одно:
+
+```text
+compare
+subtract 10
+increment tens
+```
+
+за один clock.
+
+Для четырёх полей:
+
+```text
+hours
+minutes
+seconds
+centis
+```
+
+используются четыре параллельных subtract datapath.
+
+Например:
+
+```text
+99 → 89 → 79 → 69 → 59 → 49 → 39 → 29 → 19 → 9
+```
+
+требует 9 subtract cycles.
+
+После этого формируются ASCII-символы:
 
 ```systemverilog
 8'h30 + digit
 ```
+
+Таким образом новая архитектура использует trade-off:
+
+```text
+combinational area ↓
+registers          ↑
+conversion latency ↑
+timing margin      ↑
+```
+
+Для UART увеличение conversion latency практически несущественно.
+
+При 50 MHz один clock составляет:
+
+```text
+20 ns
+```
+
+а один UART frame при 115200 baud занимает примерно:
+
+```text
+10 / 115200 ≈ 86.8 us
+```
+
+Даже worst-case binary-to-decimal conversion занимает лишь несколько сотен наносекунд до начала передачи.
 
 ---
 
@@ -301,7 +434,7 @@ s_ready
 
 и передаёт их через UART в формате 8N1.
 
-Передатчик поддерживает передачу последовательных байтов без лишнего системного idle-такта между кадрами.
+Передатчик поддерживает передачу последовательных UART frames без лишнего системного idle-clock между ними.
 
 ---
 
@@ -309,7 +442,7 @@ s_ready
 
 Формирует baud tick для UART TX.
 
-В проекте используется fractional accumulator для получения средней скорости, соответствующей:
+В проекте используется fractional accumulator / NCO-подобная схема для получения средней baud rate, соответствующей:
 
 ```text
 115200 baud
@@ -325,7 +458,7 @@ s_ready
 fire = valid && ready;
 ```
 
-Данные считаются переданными только в такт, когда одновременно:
+Данные считаются переданными только в clock cycle, когда одновременно:
 
 ```text
 valid = 1
@@ -339,7 +472,19 @@ valid = 1
 ready = 0
 ```
 
-источник удерживает текущий байт и не изменяет индекс.
+source обязан удерживать текущий байт стабильным.
+
+В `time_response_gen` индекс следующего символа изменяется только после успешного handshake.
+
+Последний байт — `LF` с индексом `12`.
+
+Переход:
+
+```text
+SEND → IDLE
+```
+
+выполняется только после handshake последнего байта.
 
 ---
 
@@ -378,44 +523,114 @@ Flow ctrl : None
 
 ---
 
-## Использование ресурсов FPGA
+# FPGA Resource Usage
 
-Текущая версия после синтеза:
+## Divider-based baseline
 
-```text
-Logic Elements : 559 / 6272 ≈ 9%
-Registers      : 186
-I/O Pins       : 4
-Memory Bits    : 0
-DSP Blocks     : 0
-PLLs           : 0
-```
-
-Одним из наиболее ресурсоёмких блоков является:
-
-```text
-time_response_gen
-```
-
-Его использование ресурсов составляет приблизительно:
-
-```text
-295 ALUT
-29 registers
-```
-
-Основная причина большого количества комбинационной логики — использование операций:
+Первая версия `time_response_gen` использовала:
 
 ```systemverilog
 / 10
 % 10
 ```
 
-Quartus реализует их с помощью комбинационных divider/modulo-блоков.
+Результат synthesis для всего проекта:
+
+```text
+Total Logic Elements : 559 / 6272 ≈ 9%
+Total Registers      : 186
+I/O Pins             : 4
+Memory Bits          : 0
+DSP Blocks           : 0
+PLLs                 : 0
+```
+
+Приблизительное использование ресурсов самим `time_response_gen`:
+
+```text
+Combinational ALUT : ~295
+Registers          : ~29
+```
+
+Большая часть комбинационной логики была связана с binary-to-decimal divider/modulo logic.
 
 ---
 
-## Timing
+## Sequential subtract version
+
+После замены `/10` и `%10` на multi-cycle subtract-by-10 архитектуру:
+
+```text
+Total Logic Elements : 404 / 6272 ≈ 6%
+Total Registers      : 229
+I/O Pins             : 4
+Memory Bits          : 0
+DSP Blocks           : 0
+PLLs                 : 0
+```
+
+Для `time_response_gen`:
+
+```text
+Combinational ALUT : 133
+Registers          : 72
+```
+
+Изменение относительно divider-based baseline:
+
+```text
+Total Logic Elements:
+559 → 404
+-155 LE
+≈ -27.7%
+
+time_response_gen ALUT:
+~295 → 133
+-162 ALUT
+≈ -54.9%
+
+Total Registers:
+186 → 229
++43 registers
+```
+
+Таким образом synthesis подтвердил ожидаемый архитектурный trade-off:
+
+```text
+AREA ↓
+REGISTERS ↑
+LATENCY ↑
+```
+
+---
+
+## Architecture Comparison
+
+| Метрика | Divider-based | Sequential subtract |
+|---|---:|---:|
+| Total Logic Elements | 559 | 404 |
+| FPGA utilization | ~9% | ~6% |
+| Total Registers | 186 | 229 |
+| `time_response_gen` ALUT | ~295 | 133 |
+| `time_response_gen` Registers | ~29 | 72 |
+| Worst Setup Slack | +5.537 ns | +10.466 ns |
+| Worst Hold Slack | +0.186 ns | +0.452 ns |
+| Conversion style | Combinational | Multi-cycle |
+| Arithmetic | `/10`, `%10` | compare / subtract |
+| Conversion latency | Low | Higher |
+| UART impact | Negligible | Negligible |
+
+Главный результат:
+
+```text
+короткий RTL-код != маленькое железо
+```
+
+Операции `/10` и `%10` выглядят компактно в SystemVerilog, но могут приводить к значительно более дорогой аппаратной реализации, чем multi-cycle datapath.
+
+---
+
+# Timing
 
 Системная частота:
 
@@ -436,85 +651,204 @@ create_clock -name clk -period 20.000 [get_ports {clk}]
 derive_clock_uncertainty
 ```
 
-После Place & Route получены следующие worst-case значения:
+## Divider-based version
+
+После Place & Route:
 
 ```text
-Setup Slack : +5.537 ns
-Hold Slack  : +0.186 ns
-TNS         : 0 ns
+Worst Setup Slack : +5.537 ns
+Worst Hold Slack  : +0.186 ns
 ```
 
-Положительный setup и hold slack означает, что анализируемые синхронные пути удовлетворяют заданному ограничению 50 MHz.
+## Sequential subtract version
 
-Если выполнить простую оценку:
+После Place & Route:
 
 ```text
-20.000 ns - 5.537 ns = 14.463 ns
+Worst Setup Slack : +10.466 ns
+Worst Hold Slack  : +0.452 ns
 ```
 
-получается около `14.463 ns` использованного setup-бюджета критического пути.
+Улучшение setup margin:
 
-Это значение является приближённой оценкой: точная задержка пути определяется через подробный отчёт TimeQuest `Report Timing`, так как STA также учитывает clock skew, setup time, clock uncertainty и задержки тактовой сети.
+```text
+10.466 ns - 5.537 ns = 4.929 ns
+```
+
+То есть после изменения архитектуры проект получил примерно:
+
+```text
++4.929 ns
+```
+
+дополнительного worst-case setup margin.
+
+Положительные setup и hold slack означают, что проанализированные синхронные пути удовлетворяют заданному clock constraint 50 MHz.
 
 ---
 
-## Текущая проблема и план оптимизации
+## Current Worst Setup Path
 
-На данный момент основная цель оптимизации — уменьшить использование логических элементов модулем `time_response_gen`.
+Для текущей sequential-версии TimeQuest показывает:
 
-Текущая реализация:
+```text
+Data Arrival Time  : 12.029 ns
+Data Required Time : 22.495 ns
+Slack              : 10.466 ns
+```
+
+Текущий worst setup path начинается в иерархии:
+
+```text
+uart_tx / baud_tick_gen
+```
+
+и заканчивается внутри:
+
+```text
+time_response_gen
+```
+
+Это означает, что после удаления divider-based combinational logic старый formatter больше не является очевидным доминирующим combinational bottleneck.
+
+Важно: `20 ns - slack` нельзя интерпретировать как точную задержку комбинационной логики.
+
+STA учитывает не только data-path logic, но также:
+
+```text
+clock paths
+setup time
+clock skew
+clock uncertainty
+routing delays
+cell delays
+```
+
+Для точного анализа используется подробный отчёт TimeQuest `Report Timing`.
+
+---
+
+# Что показал эксперимент
+
+Этот проект использовался как практический пример выбора RTL-архитектуры.
+
+### Version A — combinational division
 
 ```systemverilog
 tens = value / 10;
 ones = value % 10;
 ```
 
-удобна с точки зрения RTL, однако после синтеза приводит к значительным аппаратным затратам.
+Плюсы:
 
-Планируется исследовать альтернативный вариант преобразования binary-to-decimal через последовательное вычитание:
+- простой RTL;
+- минимальная conversion latency.
+
+Минусы:
+
+- высокая стоимость комбинационной логики;
+- более длинные timing paths.
+
+### Version B — sequential subtract
 
 ```text
-temp = value
-tens = 0
-
-while temp >= 10:
-    temp -= 10
-    tens++
-
-ones = temp
+compare
+subtract 10
+increment counter
+repeat on next clock
 ```
 
-В RTL данный алгоритм планируется реализовать последовательно по тактам, а не через комбинационный `while`.
+Плюсы:
 
-Такой вариант позволит обменять небольшое увеличение latency на существенное уменьшение количества комбинационной логики.
+- значительно меньше combinational logic;
+- больше timing margin;
+- хорошо демонстрирует hardware reuse во времени.
 
-Для UART это приемлемо, поскольку FPGA работает на частоте 50 MHz, тогда как передача одного UART-байта при 115200 baud занимает значительно больше времени.
+Минусы:
 
-После реализации новой версии планируется сравнить:
+- больше registers;
+- требуется FSM/control path;
+- conversion занимает несколько clock cycles.
 
-| Метрика | Текущая версия | Оптимизированная версия |
-|---|---:|---:|
-| Logic Elements | 559 | TBD |
-| Registers | 186 | TBD |
-| `time_response_gen` ALUT | 295 | TBD |
-| Setup Slack | +5.537 ns | TBD |
-| Hold Slack | +0.186 ns | TBD |
-| Conversion latency | combinational | TBD |
+Для данного проекта Version B выгодна, поскольку UART значительно медленнее внутреннего 50 MHz datapath.
 
 ---
 
-## Дальнейшее развитие
+# Возможные дальнейшие архитектуры
+
+Следующий вариант для исследования — ещё более area-oriented formatter с одним общим converter:
+
+```text
+hours
+  ↓
+shared converter
+  ↓
+minutes
+  ↓
+shared converter
+  ↓
+seconds
+  ↓
+shared converter
+  ↓
+centis
+```
+
+Такой вариант может переиспользовать:
+
+```text
+1 comparator
+1 subtractor
+1 temporary register
+1 tens counter
+```
+
+ценой ещё большей conversion latency.
+
+Ещё одна возможная архитектура — хранить время непосредственно в BCD:
+
+```text
+hour_tens
+hour_ones
+minute_tens
+minute_ones
+second_tens
+second_ones
+centis_tens
+centis_ones
+```
+
+Тогда ASCII formatting становится почти бесплатным:
+
+```systemverilog
+8'h30 + digit
+```
+
+но усложняется datapath самого секундомера.
+
+---
+
+# Дальнейшее развитие
 
 Планируемые этапы:
 
-- оптимизация binary-to-decimal преобразования;
-- сравнение различных архитектур преобразования времени;
-- добавление команды `LAP`;
-- обработка ответов на неизвестные команды;
-- дальнейшее изучение STA/SDC;
-- анализ проекта через RTL Viewer и Technology Map Viewer;
-- исследование CDC и metastability;
-- использование SignalTap для отладки внутренних сигналов FPGA.
+- анализ новой схемы через RTL Viewer;
+- анализ Technology Map Viewer;
+- изучение Chip Planner;
+- использование SignalTap для отладки;
+- более глубокий STA;
+- дальнейшее изучение SDC;
+- reset architecture;
+- CDC и metastability;
+- pulse crossing и handshake;
+- asynchronous FIFO;
+- SPI;
+- I2C;
+- Avalon / AXI;
+- VGA/video logic;
+- DSP и pipelining;
+- собственный небольшой CPU;
+- возможный RISC-V soft-core.
 
 ---
 
@@ -523,9 +857,15 @@ ones = temp
 Проект разработан с использованием:
 
 ```text
-Intel Quartus Prime Lite 21.1
+Intel Quartus Prime Lite 21.1 Build 842
 SystemVerilog
 Cyclone IV E
+```
+
+FPGA:
+
+```text
+EP4CE6F17C8N
 ```
 
 Для обмена данными с FPGA используется UART через виртуальный COM-порт.
@@ -534,22 +874,33 @@ Cyclone IV E
 
 ## Статус проекта
 
-Текущая версия:
+Текущая sequential-версия:
 
 ```text
-UART RX/TX        — implemented
-Command parser    — implemented
-START             — implemented
-STOP              — implemented
-CLEAR             — implemented
-TIME              — implemented
-Stopwatch core    — implemented
-ASCII formatting  — implemented
-Timing constraints — implemented
+UART RX                  — implemented
+UART TX                  — implemented
+Command parser            — implemented
+START                     — implemented
+STOP                      — implemented
+CLEAR                     — implemented
+TIME                      — implemented
+Stopwatch core            — implemented
+TIME snapshot             — implemented
+Sequential BCD conversion — implemented
+Ready/valid transmission  — implemented
+Timing constraints        — implemented
+Quartus synthesis         — passed
+Static Timing Analysis    — passed
+Automated testbench       — not added yet
 ```
 
-Следующий этап:
+Текущий архитектурный milestone:
 
 ```text
-Optimization of time_response_gen
+Divider-based TIME formatter
+        ↓
+Sequential subtract-by-10 TIME formatter
+        ↓
+resource usage reduced
+timing margin increased
 ```
